@@ -1,9 +1,3 @@
-//! The intent is to provide everything in the OpenCL 3.0 spec. You can't enforce a specific OpenCL version at
-//! compile-time; reference the OpenCL spec for the list of features available in your target version.
-//!
-//! Compile-time version enforcement can be implemented, I just haven't needed it yet. Feel free to create
-//! an issue or pull request if you want this feature.
-
 const std = @import("std");
 pub const c = @cImport({
     @cDefine("CL_TARGET_OPENCL_VERSION", "300");
