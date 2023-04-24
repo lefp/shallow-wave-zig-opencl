@@ -6,14 +6,15 @@
 // @todo is there any reason to make these types `comptime_int`?
 const TEXTURE_WIDTH : usize = 800;
 const TEXTURE_HEIGHT: usize = 600;
-const PIXEL_FORMAT = PixelFormat { // @note when modifying any value, make sure the others match
+const PIXEL_FORMAT = .{ // @note when modifying any value, make sure the others match
     .sdl_format = c.SDL_PIXELFORMAT_RGBA8888, // @todo consider RGB888, but suspect that it won't match OpenCL kernel memory alignment
-    .opencl_format = c.cl_image_format {
-        .image_channel_order = c.CL_RGBA,
-        .image_channel_data_type = c.CL_UNORM_INT8,
+    .opencl_format = cl.ImageFormat {
+        .channel_order = cl.ImageFormat.ChannelOrder.RGBA,
+        .channel_data_type = cl.ImageFormat.ChannelDataType.unorm_int8,
     },
     .bytes_per_pixel = 4,
 };
+const OPENCL_PROGRAM_SRC_PATH = "src/kernels.cl";
 
 // derived constants
 const N_PIXELS: usize = TEXTURE_WIDTH*TEXTURE_HEIGHT;
@@ -30,23 +31,82 @@ const c = @cImport({
     @cInclude("SDL2/SDL.h");
 });
 
+const log = std.log;
+const allocator = std.heap.c_allocator;
+
 //
 // MAIN ======================================================================================================
 //
 
-pub fn main() void {
+pub fn main() !void {
 
     // OpenCL initialization ---------------------------------------------------------------------------------
 
-    // get platforms
-    const num_platforms: u32 = cl.getNumPlatforms() catch @panic("failed to get number of platforms");
-    if (num_platforms == 0) @panic("No OpenCL platforms found");
-    std.log.info("Found {} OpenCL platforms.\n", .{num_platforms});
-    // var platform_ids = std.ArrayList(c.cl_uint).initCapacity(std.heap.c_allocator, num_platforms);
-    var platform_ids = std.heap.raw_c_allocator.alloc(cl.PlatformID, num_platforms) catch @panic("failed to allocate");
-    defer platform_ids.free();
-    cl.getPlatformIDs(platform_ids) catch @panic("failed to get platform ids");
-    std.process.exit(0); // @continue
+    const device = select_device: {
+        const platform_ids = try cl.getAllPlatformIDs(allocator);
+        defer allocator.free(platform_ids);
+        if (platform_ids.len == 0) @panic("no OpenCL platforms found");
+        log.info("Found {} OpenCL platforms.", .{platform_ids.len});
+
+        // @todo smarter platform selection
+        const selected_platform = platform_ids[0];
+
+        const platform_name = try cl.getPlatformName(selected_platform, allocator);
+        defer allocator.free(platform_name);
+        log.info("Chose platform {s}.", .{platform_name});
+
+        const device_ids = try cl.getAllDeviceIDs(selected_platform, cl.DEVICE_TYPE_GPU, allocator);
+        defer allocator.free(device_ids);
+        if (device_ids.len == 0) @panic("no devices found for chosen OpenCL platform");
+        // @todo smarter device selection
+        const selected_device = device_ids[0];
+
+        const device_name = try cl.getDeviceName(selected_device, allocator);
+        log.info("Chose device {s}.", .{device_name});
+
+        break :select_device selected_device;
+    };
+    const context = try cl.createContext(&[_]cl.DeviceID{device});
+    const image = try cl.createImage(
+        context,
+        cl.MemFlags { .write_only = true, .host_read_only = true },
+        PIXEL_FORMAT.opencl_format,
+        cl.ImageDescriptor {
+            .type = cl.MemObjectType.image2d,
+            .width = TEXTURE_WIDTH,
+            .height = TEXTURE_HEIGHT,
+            .depth = 1,
+            .image_array_size = 1,
+            .row_pitch = 0,
+            .slice_pitch = 0,
+            .mem_object = null,
+        },
+        null
+    );
+
+    const render_kernel = create_kernel: {
+        const file = try std.fs.cwd().openFile(OPENCL_PROGRAM_SRC_PATH, .{});
+        const file_len = try file.getEndPos() + 1;
+        const src = try file.readToEndAlloc(allocator, file_len);
+        defer allocator.free(src);
+        file.close();
+
+        const program = try cl.createProgramWithSource(context, src);
+        try cl.buildProgram(program, &[_]cl.DeviceID{device}, null);
+        const kernel = try cl.createKernel(program, "render");
+        break :create_kernel kernel;
+        // @todo create kernel
+    };
+    _ = render_kernel;
+
+    // @todo create queues
+
+    // @todo next steps:
+    //    create program
+    //    create simple render kernel
+    //    enqueue kernel to render to image
+    //    copy rendered image to texture buffer on host
+    _ = image;
 
     // SDL initialization ------------------------------------------------------------------------------------
 
@@ -110,11 +170,11 @@ pub fn main() void {
 // STRUCTS AND FUNCTIONS =====================================================================================
 //
 
-const PixelFormat = struct {
-    opencl_format: c.cl_image_format,
-    bytes_per_pixel: usize,
-    sdl_format: c.SDL_PixelFormatEnum,
-};
+// const PixelFormat = struct {
+//     opencl_format: c.cl_image_format,
+//     bytes_per_pixel: usize,
+//     sdl_format: c.SDL_PixelFormatEnum,
+// };
 
 inline fn enforce0(val: c_int) void {
     if (val != 0) @panic("Value was not 0");
