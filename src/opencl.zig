@@ -174,14 +174,15 @@ fn checkClErrCode(code: i32) OpenClErr!void {
 
 // @todo are the integer and float types going to have the right alignment and ABI for C interop?
 
-pub const PlatformID = c.cl_platform_id;
-pub const DeviceID = c.cl_device_id;
+pub const Platform = c.cl_platform_id;
+pub const Device = c.cl_device_id;
 pub const Version = c.cl_version;
-pub const ClVersion = c.cl_version;
 pub const Context = c.cl_context;
 pub const Mem = c.cl_mem;
 pub const Program = c.cl_program;
 pub const Kernel = c.cl_kernel;
+pub const CommandQueue = c.cl_command_queue;
+pub const Event = c.cl_event;
 
 pub const DeviceType = u64;
 
@@ -289,12 +290,22 @@ pub const ImageDescriptor = extern struct {
     mem_object: Mem, // a buffer or image. In the OpenCL spec this is a union, but I see no reason to do that
 };
 
+// Order determined from "CL/cl.h".
+pub const CommandQueueProperties = packed struct(u64) {
+    OutOfOrderExecMode: bool = false,
+    Profiling         : bool = false,
+    OnDevice          : bool = false,
+    OnDeviceDefault   : bool = false,
+    _padding: u60 = 0,
+};
+
 //
 // FUNCTIONS =================================================================================================
 //
 
 // platforms -------------------------------------------------------------------------------------------------
 
+// @todo should you really be inlining all these functions?
 pub inline fn getNumPlatforms() OpenClErr!u32 {
     var num: u32 = undefined;
     try checkClErrCode(c.clGetPlatformIDs(0, null, &num));
@@ -303,14 +314,14 @@ pub inline fn getNumPlatforms() OpenClErr!u32 {
 /// The number of platform IDs to get should be encoded in the fat pointer `dst`.
 // @todo does `dst` need to be allocated with C alignment? Maybe that's guaranteed by the fact that PlatformID
 // is declared as opaque?
-pub inline fn getPlatformIDs(dst: []PlatformID) OpenClErr!void {
+pub inline fn getPlatformIDs(dst: []Platform) OpenClErr!void {
     try checkClErrCode(c.clGetPlatformIDs(@intCast(u32, dst.len), dst.ptr, null));
 }
 
 /// @note The caller is responsible for freeing the returned slice.
-pub fn getAllPlatformIDs(allocator: Allocator) (AllocErr||OpenClErr)![]PlatformID {
+pub fn getAllPlatformIDs(allocator: Allocator) (AllocErr||OpenClErr)![]Platform {
     const num_platforms = try getNumPlatforms();
-    var platform_ids = try allocator.alloc(PlatformID, num_platforms);
+    var platform_ids = try allocator.alloc(Platform, num_platforms);
     try getPlatformIDs(platform_ids);
     return platform_ids;
 }
@@ -350,7 +361,7 @@ pub fn getAllPlatformIDs(allocator: Allocator) (AllocErr||OpenClErr)![]PlatformI
 // }
 
 /// Returns a null-terminated string, in the form of a fat pointer so that you can call `free` on it.
-pub fn getPlatformName(platform: PlatformID, allocator: Allocator) (AllocErr||OpenClErr)![]u8{
+pub fn getPlatformName(platform: Platform, allocator: Allocator) (AllocErr||OpenClErr)![]u8{
     var str_size: usize = undefined;
     // @todo not sure that the spec allows us to use 0 for the size
     try checkClErrCode(c.clGetPlatformInfo(platform, c.CL_PLATFORM_NAME, 0, null, &str_size));
@@ -363,14 +374,14 @@ pub fn getPlatformName(platform: PlatformID, allocator: Allocator) (AllocErr||Op
 // devices ---------------------------------------------------------------------------------------------------
 
 /// device_type is a bitfield; use e.g. `DEVICE_TYPE_GPU` for the type you want.
-pub inline fn getNumDevices(platform: PlatformID, device_type: DeviceType) OpenClErr!u32 {
+pub inline fn getNumDevices(platform: Platform, device_type: DeviceType) OpenClErr!u32 {
     var num: u32 = undefined;
     try checkClErrCode(c.clGetDeviceIDs(platform, device_type, 0, null, &num));
     return num;
 }
 /// The number of IDs to get should be encoded in the fat pointer `dst`.
 pub inline fn getDeviceIDs(
-    platform: PlatformID, device_type: DeviceType, dst: []const DeviceID
+    platform: Platform, device_type: DeviceType, dst: []const Device
 ) OpenClErr!void {
     try checkClErrCode(
         c.clGetDeviceIDs(platform, device_type, @intCast(u32, dst.len), @constCast(dst.ptr), null)
@@ -379,15 +390,15 @@ pub inline fn getDeviceIDs(
 
 /// @note The caller is responsible for freeing the returned slice.
 pub fn getAllDeviceIDs(
-    platform: PlatformID, device_type: DeviceType, allocator: Allocator
-) (AllocErr||OpenClErr)![]DeviceID {
+    platform: Platform, device_type: DeviceType, allocator: Allocator
+) (AllocErr||OpenClErr)![]Device {
     const num_devices = try getNumDevices(platform, device_type);
-    var device_ids = try allocator.alloc(DeviceID, num_devices);
+    var device_ids = try allocator.alloc(Device, num_devices);
     try getDeviceIDs(platform, device_type, device_ids);
     return device_ids;
 }
 
-pub fn getDeviceName(device: DeviceID, allocator: Allocator) (AllocErr||OpenClErr)![]u8 {
+pub fn getDeviceName(device: Device, allocator: Allocator) (AllocErr||OpenClErr)![]u8 {
     var str_size: usize = undefined;
     // @todo not sure that the spec allows us to use 0 for the size
     try checkClErrCode(c.clGetDeviceInfo(device, c.CL_DEVICE_NAME, 0, null, &str_size));
@@ -399,7 +410,7 @@ pub fn getDeviceName(device: DeviceID, allocator: Allocator) (AllocErr||OpenClEr
 
 // context ---------------------------------------------------------------------------------------------------
 
-pub fn createContext(devices: []const DeviceID) OpenClErr!Context {
+pub fn createContext(devices: []const Device) OpenClErr!Context {
     var errcode: i32 = undefined;
     const context = c.clCreateContext(
         null, @intCast(u32, devices.len), @constCast(devices.ptr), null, null, &errcode
@@ -407,8 +418,15 @@ pub fn createContext(devices: []const DeviceID) OpenClErr!Context {
     try checkClErrCode(errcode);
     return context;
 }
+pub inline fn releaseContext(context: Context) OpenClErr!void {
+    try checkClErrCode( c.clReleaseContext(context) );
+}
 
-// image -----------------------------------------------------------------------------------------------------
+// memory objects --------------------------------------------------------------------------------------------
+
+pub inline fn releaseMemObject(object: Mem) OpenClErr!void {
+    try checkClErrCode( c.clReleaseMemObject(object) );
+}
 
 pub fn createImage( // @todo should I make this a method of Context? Would "feel" more convenient
     context: Context,
@@ -432,6 +450,7 @@ pub fn createImage( // @todo should I make this a method of Context? Would "feel
 
 // program ---------------------------------------------------------------------------------------------------
 
+/// Note: creating the program is not enough; you must also build it using `buildProgram()`.
 pub fn createProgramWithSource(context: Context, src: []const u8) OpenClErr!Program {
     var errcode: i32 = undefined;
     const program = c.clCreateProgramWithSource(
@@ -444,10 +463,13 @@ pub fn createProgramWithSource(context: Context, src: []const u8) OpenClErr!Prog
     try checkClErrCode(errcode);
     return program;
 }
+pub inline fn releaseProgram(program: Program) OpenClErr!void {
+    try checkClErrCode( c.clReleaseProgram(program) );
+}
 
-
+// @todo implement a safe/convenient way to pass '-D' definitions
 pub inline fn buildProgram(
-    program: Program, devices: []const DeviceID, options: ?[*:0]const u8
+    program: Program, devices: []const Device, options: ?[*:0]const u8
 ) OpenClErr!void {
     try checkClErrCode(
         c.clBuildProgram(program, @intCast(u32, devices.len), devices.ptr, options, null, null)
@@ -461,4 +483,76 @@ pub fn createKernel(program: Program, name: [*:0]const u8) OpenClErr!Kernel {
     const kernel = c.clCreateKernel(program, @constCast(name), &errcode);
     try checkClErrCode(errcode);
     return kernel;
+}
+pub inline fn releaseKernel(kernel: Kernel) OpenClErr!void {
+    try checkClErrCode( c.clReleaseKernel(kernel) );
+}
+
+// @todo maybe come up with a way to set kernel arguments that reduces the probability of passing the wrong index
+pub fn setKernelArg(
+    kernel: Kernel, arg_index: u32, comptime ArgType: type, arg: *const ArgType
+) OpenClErr!void {
+    try checkClErrCode(
+        c.clSetKernelArg(kernel, arg_index, @sizeOf(ArgType), @ptrCast(*const anyopaque, arg))
+    );
+}
+
+// queue -----------------------------------------------------------------------------------------------------
+
+pub fn createCommandQueue(
+    context: Context, device: Device, properties: CommandQueueProperties
+) OpenClErr!CommandQueue {
+    var errcode: i32 = undefined;
+    const queue = c.clCreateCommandQueue(context, device, @bitCast(u64, properties), &errcode);
+    try checkClErrCode(errcode);
+    return queue;
+}
+pub inline fn releaseCommandQueue(queue: CommandQueue) OpenClErr!void {
+    try checkClErrCode( c.clReleaseCommandQueue(queue) );
+}
+
+pub fn enqueueNDRangeKernel(
+    queue: CommandQueue,
+    kernel: Kernel,
+    n_dims: u32,
+    global_work_offset: ?[*]const usize,
+    global_work_size: [*]const usize, // the spec says this parameter is optional, but I don't like that
+    local_work_size: [*]const usize, // the spec doesn't say that this parameter is optional
+    waitlist: ?[]const Event,
+    event: ?*Event
+) OpenClErr!void {
+    try checkClErrCode(
+        c.clEnqueueNDRangeKernel(
+            queue, kernel, n_dims, global_work_offset, global_work_size, local_work_size,
+            if (waitlist) |wl| @intCast(u32, wl.len) else 0,
+            if (waitlist) |wl| wl.ptr else null,
+            event
+        )
+    );
+}
+
+// @todo consider abstracting away the whole "origin, region, row_pitch, slice_pitch" stuff by providing a
+// special `FatImage` struct that contains that information, and an associated `read` function. Maybe put this
+// in a separate file for higher-level / more-abstracted functions
+pub fn enqueueReadImage(
+    queue: CommandQueue,
+    image: Mem,
+    blocking: bool,
+    origin: [*]const usize,
+    region: [*]const usize,
+    row_pitch  : usize,
+    slice_pitch: usize,
+    dst: [*]u8,
+    waitlist: ?[]const Event,
+    event: ?*Event
+) OpenClErr!void {
+    // std.debug.assert(origin.len == region.len);
+    try checkClErrCode(
+        c.clEnqueueReadImage(
+            queue, image, @boolToInt(blocking), origin, region, row_pitch, slice_pitch, dst,
+            if (waitlist) |wl| @intCast(u32, wl.len) else 0,
+            if (waitlist) |wl| wl.ptr else null,
+            event
+        )
+    );
 }

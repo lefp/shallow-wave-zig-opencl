@@ -7,7 +7,13 @@
 const TEXTURE_WIDTH : usize = 800;
 const TEXTURE_HEIGHT: usize = 600;
 const PIXEL_FORMAT = .{ // @note when modifying any value, make sure the others match
-    .sdl_format = c.SDL_PIXELFORMAT_RGBA8888, // @todo consider RGB888, but suspect that it won't match OpenCL kernel memory alignment
+    // @note: unintuitively, SDL_PIXELFORMAT_RGBA32 is the format in which bytes are in RGBA order regardless
+    // of endianness, while RGBA8888's byte order DOES depend on endianness.
+    // See this comment from "SDL2/SDL_pixels.h", about the `struct SDL_Color { Uint8 r, g, b, a }`:
+    // * The bits of this structure can be directly reinterpreted as an integer-packed
+    // * color which uses the SDL_PIXELFORMAT_RGBA32 format (SDL_PIXELFORMAT_ABGR8888
+    // * on little-endian systems and SDL_PIXELFORMAT_RGBA8888 on big-endian systems).
+    .sdl_format = c.SDL_PIXELFORMAT_RGBA32, // not using RGB888 because don't wanna deal with the memory alignment
     .opencl_format = cl.ImageFormat {
         .channel_order = cl.ImageFormat.ChannelOrder.RGBA,
         .channel_data_type = cl.ImageFormat.ChannelDataType.unorm_int8,
@@ -66,7 +72,10 @@ pub fn main() !void {
 
         break :select_device selected_device;
     };
-    const context = try cl.createContext(&[_]cl.DeviceID{device});
+    const context = try cl.createContext(&[_]cl.Device{device});
+    defer cl.releaseContext(context) catch log.warn("failed to release context", .{});
+    const queue = try cl.createCommandQueue(context, device, .{});
+    defer cl.releaseCommandQueue(queue) catch log.warn("failed to release queue", .{});
     const image = try cl.createImage(
         context,
         cl.MemFlags { .write_only = true, .host_read_only = true },
@@ -83,7 +92,7 @@ pub fn main() !void {
         },
         null
     );
-
+    defer cl.releaseMemObject(image) catch log.warn("failed to release image", .{});
     const render_kernel = create_kernel: {
         const file = try std.fs.cwd().openFile(OPENCL_PROGRAM_SRC_PATH, .{});
         const file_len = try file.getEndPos() + 1;
@@ -92,21 +101,13 @@ pub fn main() !void {
         file.close();
 
         const program = try cl.createProgramWithSource(context, src);
-        try cl.buildProgram(program, &[_]cl.DeviceID{device}, null);
+        defer cl.releaseProgram(program) catch log.warn("failed to release program", .{});
+        try cl.buildProgram(program, &[_]cl.Device{device}, null);
+
         const kernel = try cl.createKernel(program, "render");
         break :create_kernel kernel;
-        // @todo create kernel
     };
-    _ = render_kernel;
-
-    // @todo create queues
-
-    // @todo next steps:
-    //    create program
-    //    create simple render kernel
-    //    enqueue kernel to render to image
-    //    copy rendered image to texture buffer on host
-    _ = image;
+    defer cl.releaseKernel(render_kernel) catch log.warn("failed to release kernel", .{});
 
     // SDL initialization ------------------------------------------------------------------------------------
 
@@ -139,8 +140,34 @@ pub fn main() !void {
 
     // @todo Let OpenCL allocate this using CL_MEM_ALLOC_HOST_PTR, because "something something pinned memory
     // is fast".
-    // @todo initialize pixel_buffer as `undefined` and render the initial condition to it using OpenCL
-    const pixel_hostbuffer = [_]u8{0}**(N_PIXELS*PIXEL_FORMAT.bytes_per_pixel);
+    var pixel_hostbuffer: [N_PIXELS*PIXEL_FORMAT.bytes_per_pixel]u8 = undefined;
+
+    // render first frame
+    // @todo make index a global constant so that it's easier to change when the kernel signature changes
+    try cl.setKernelArg(render_kernel, 0, @TypeOf(image), &image);
+    try cl.enqueueNDRangeKernel(
+        queue,
+        render_kernel,
+        2,
+        null,
+        &[_]usize {TEXTURE_WIDTH, TEXTURE_HEIGHT},
+        &[_]usize {8, 8}, // @todo decide local work size
+        null,
+        null
+    );
+    try cl.enqueueReadImage(
+        queue,
+        image,
+        true,
+        &[_]usize {0, 0, 0},
+        &[_]usize {TEXTURE_WIDTH, TEXTURE_HEIGHT, 1},
+        TEXTURE_WIDTH * PIXEL_FORMAT.bytes_per_pixel,
+        0,
+        &pixel_hostbuffer,
+        null,
+        null
+    );
+
     enforce0(
         c.SDL_UpdateTexture(sdl_texture, null, &pixel_hostbuffer, TEXTURE_WIDTH*PIXEL_FORMAT.bytes_per_pixel)
     );
