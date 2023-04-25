@@ -32,13 +32,6 @@ const RENDER_KERNEL_PARAM_INDICES = struct {
     const axis_max     : u32 = 3;
 };
 
-const FRAMERATE = struct {
-    const fps: usize = 60;
-
-    // derived
-    const interval_nanoseconds: u64 = 1_000_000_000 / fps;
-};
-
 const GRID = struct {
     const domain_size = struct {
         const x: f32 = 25;
@@ -84,6 +77,13 @@ const TEXTURE = struct {
     // derived
     const height: usize = (GRID.domain_size.y / GRID.domain_size.x) * @intToFloat(f32, width);
     const n_pixels: usize = width*height;
+};
+
+const FRAMERATE = struct {
+    const fps: usize = 60;
+
+    // derived
+    const interval_nanoseconds: u64 = 1_000_000_000 / fps;
 };
 
 //
@@ -312,9 +312,16 @@ pub fn main() !void {
     enforce0(c.SDL_RenderCopy(sdl_renderer, sdl_texture, null, null));
     c.SDL_RenderPresent(sdl_renderer);
 
+    // loop variables
     var event: c.SDL_Event = undefined;
     var exists_pending_event: bool = undefined;
     var frame_timer = try std.time.Timer.start();
+    const perf_reporting = struct {
+        var current_iter: usize = 0;
+        var iter_one_second_ago: usize = 0;
+        var timer: std.time.Timer = undefined;
+    };
+    perf_reporting.timer = try std.time.Timer.start();
 
     main_loop: while (true) {
         // keep simulating
@@ -338,17 +345,28 @@ pub fn main() !void {
                 else => {},
             }
         }
+
+        perf_reporting.current_iter += @as(usize, 1);
+        // print iteration data
+        if (perf_reporting.timer.read() >= 1_000_000_000) { // one second = 1_000_000_000 nanoseconds
+            perf_reporting.timer.reset();
+            // @todo not sure of the appropriate log type to use here; maybe create a special "perf" log
+            // output thing? We don't want a shitton of these messages being written to a file.
+            log.debug(
+                "iteration: {:10} ({:7} per second)",
+                .{
+                    perf_reporting.current_iter,
+                    perf_reporting.current_iter - perf_reporting.iter_one_second_ago
+                }
+            );
+            perf_reporting.iter_one_second_ago = perf_reporting.current_iter;
+        }
+
+        // update display
         if (frame_timer.read() >= FRAMERATE.interval_nanoseconds) {
             frame_timer.reset();
             try cl.enqueueNDRangeKernel(
-                ocl_queue,
-                render_kernel,
-                2,
-                null,
-                &[_]usize {TEXTURE.width, TEXTURE.height},
-                null,
-                null,
-                null
+                ocl_queue, render_kernel, 2, null, &[_]usize {TEXTURE.width, TEXTURE.height}, null, null, null
             );
             try cl.enqueueReadImage(
                 ocl_queue,
