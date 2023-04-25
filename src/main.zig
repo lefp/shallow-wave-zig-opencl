@@ -322,8 +322,22 @@ pub fn main() !void {
         var timer: std.time.Timer = undefined;
     };
     perf_reporting.timer = try std.time.Timer.start();
+    var paused: bool = true;
 
     main_loop: while (true) {
+        // process pending events
+        exists_pending_event = c.SDL_PollEvent(&event) != 0;
+        while (exists_pending_event) : (exists_pending_event = c.SDL_PollEvent(&event) != 0) {
+            switch (event.type) {
+                c.SDL_QUIT => break :main_loop,
+                c.SDL_KEYDOWN =>  { if (event.key.keysym.sym == c.SDLK_p) paused = !paused; },
+                else => {},
+            }
+        }
+
+        // if paused, take no further action
+        if (paused) continue;
+
         // keep simulating
         try cl.enqueueNDRangeKernel(
             ocl_queue,
@@ -335,16 +349,6 @@ pub fn main() !void {
             null,
             null
         );
-
-        // process pending events
-        exists_pending_event = c.SDL_PollEvent(&event) != 0;
-        while (exists_pending_event) : (exists_pending_event = c.SDL_PollEvent(&event) != 0) {
-            switch (event.type) {
-                c.SDL_QUIT => break :main_loop,
-                // @todo keypress P => pause
-                else => {},
-            }
-        }
 
         perf_reporting.current_iter += @as(usize, 1);
         // print iteration data
