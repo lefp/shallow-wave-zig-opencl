@@ -166,13 +166,54 @@ fn checkClErrCode(code: i32) OpenClErr!void {
 // TYPES =====================================================================================================
 //
 
-// @todo are the integer and float types going to have the right alignment and ABI for C interop?
+pub const UInt2 = extern union {
+    arr: [2]u32 align(8),
+    vec: packed struct { x: u32, y: u32 },
+
+    comptime { std.debug.assert(@sizeOf(@This()) == 8); }
+};
+pub const UInt4 = extern union {
+    arr: [4]u32 align(16),
+    vec: extern struct { x: u32, y: u32, z: u32, w: u32, },
+    float2: extern struct { lo: UInt2, hi: UInt2 },
+
+    comptime { std.debug.assert(@sizeOf(@This()) == 16); }
+};
+
+pub const Int2 = extern union {
+    arr: [2]i32 align(8),
+    vec: packed struct { x: i32, y: i32 },
+
+    comptime { std.debug.assert(@sizeOf(@This()) == 8); }
+};
+pub const Int4 = extern union {
+    arr: [4]i32 align(16),
+    vec: extern struct { x: i32, y: i32, z: i32, w: i32, },
+    float2: extern struct { lo: Int2, hi: Int2 },
+
+    comptime { std.debug.assert(@sizeOf(@This()) == 16); }
+};
+
+pub const Float2 = extern union {
+    arr: [2]f32 align(8),
+    vec: packed struct { x: f32, y: f32 },
+
+    comptime { std.debug.assert(@sizeOf(@This()) == 8); }
+};
+pub const Float4 = extern union {
+    arr: [4]f32 align(16),
+    vec: extern struct { x: f32, y: f32, z: f32, w: f32, },
+    float2: extern struct { lo: Float2, hi: Float2 },
+    // simd: @Vector(4, f32), // @todo ?? understand before including this
+
+    comptime { std.debug.assert(@sizeOf(@This()) == 16); }
+};
 
 pub const Platform = c.cl_platform_id;
 pub const Device = c.cl_device_id;
 pub const Version = c.cl_version;
 pub const Context = c.cl_context;
-pub const Mem = c.cl_mem;
+pub const Mem = c.cl_mem; // buffer, image, etc
 pub const Program = c.cl_program;
 pub const Kernel = c.cl_kernel;
 pub const CommandQueue = c.cl_command_queue;
@@ -422,6 +463,13 @@ pub inline fn releaseMemObject(object: Mem) OpenClErr!void {
     try checkClErrCode( c.clReleaseMemObject(object) );
 }
 
+pub fn createBuffer(context: Context, flags: MemFlags, size: usize, host_ptr: ?*anyopaque) OpenClErr!Mem {
+    var errcode: i32 = undefined;
+    const buffer = c.clCreateBuffer(context, @bitCast(u64, flags), size, host_ptr, &errcode);
+    try checkClErrCode(errcode);
+    return buffer;
+}
+
 pub fn createImage( // @todo should I make this a method of Context? Would "feel" more convenient
     context: Context,
     flags: MemFlags,
@@ -505,13 +553,15 @@ pub inline fn releaseCommandQueue(queue: CommandQueue) OpenClErr!void {
     try checkClErrCode( c.clReleaseCommandQueue(queue) );
 }
 
+/// @note The spec doesn't say that the `local_work_size` parameter is optional, but I've seen passing `NULL`
+/// produce significantly better performance. Do so at your own risk.
 pub fn enqueueNDRangeKernel(
     queue: CommandQueue,
     kernel: Kernel,
     n_dims: u32,
     global_work_offset: ?[*]const usize,
     global_work_size: [*]const usize, // the spec says this parameter is optional, but I don't like that
-    local_work_size: [*]const usize, // the spec doesn't say that this parameter is optional
+    local_work_size: ?[*]const usize,
     waitlist: ?[]const Event,
     event: ?*Event
 ) OpenClErr!void {
