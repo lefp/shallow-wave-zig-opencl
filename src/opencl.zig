@@ -456,11 +456,17 @@ pub fn createContext(devices: []const Device) OpenClErr!Context {
 pub inline fn releaseContext(context: Context) OpenClErr!void {
     try checkClErrCode( c.clReleaseContext(context) );
 }
+pub inline fn retainContext(context: Context) OpenClErr!void {
+    try checkClErrCode( c.clRetainContext(context) );
+}
 
 // memory objects --------------------------------------------------------------------------------------------
 
 pub inline fn releaseMemObject(object: Mem) OpenClErr!void {
     try checkClErrCode( c.clReleaseMemObject(object) );
+}
+pub inline fn retainMemObject(object: Mem) OpenClErr!void {
+    try checkClErrCode( c.clRetainMemObject(object) );
 }
 
 pub fn createBuffer(context: Context, flags: MemFlags, size: usize, host_ptr: ?*anyopaque) OpenClErr!Mem {
@@ -508,6 +514,9 @@ pub fn createProgramWithSource(context: Context, src: []const u8) OpenClErr!Prog
 pub inline fn releaseProgram(program: Program) OpenClErr!void {
     try checkClErrCode( c.clReleaseProgram(program) );
 }
+pub inline fn retainProgram(program: Program) OpenClErr!void {
+    try checkClErrCode( c.clRetainProgram(program) );
+}
 
 // @todo implement a safe/convenient way to pass '-D' definitions
 pub inline fn buildProgram(
@@ -528,6 +537,9 @@ pub fn createKernel(program: Program, name: [*:0]const u8) OpenClErr!Kernel {
 }
 pub inline fn releaseKernel(kernel: Kernel) OpenClErr!void {
     try checkClErrCode( c.clReleaseKernel(kernel) );
+}
+pub inline fn retainKernel(kernel: Kernel) OpenClErr!void {
+    try checkClErrCode( c.clRetainKernel(kernel) );
 }
 
 // @todo maybe come up with a way to set kernel arguments that reduces the probability of passing the wrong index
@@ -551,6 +563,16 @@ pub fn createCommandQueue(
 }
 pub inline fn releaseCommandQueue(queue: CommandQueue) OpenClErr!void {
     try checkClErrCode( c.clReleaseCommandQueue(queue) );
+}
+pub inline fn retainCommandQueue(queue: CommandQueue) OpenClErr!void {
+    try checkClErrCode( c.clRetainCommandQueue(queue) );
+}
+
+pub inline fn flush(queue: CommandQueue) OpenClErr!void {
+    try checkClErrCode( c.clFlush(queue) );
+}
+pub inline fn finish(queue: CommandQueue) OpenClErr!void {
+    try checkClErrCode( c.clFinish(queue) );
 }
 
 /// @note The spec doesn't say that the `local_work_size` parameter is optional, but I've seen passing `NULL`
@@ -599,4 +621,17 @@ pub fn enqueueReadImage(
             event
         )
     );
+}
+
+// events ----------------------------------------------------------------------------------------------------
+
+pub fn releaseEvent(event: Event) OpenClErr!void {
+    try checkClErrCode( c.clReleaseEvent(event) );
+}
+pub fn retainEvent(event: Event) OpenClErr!void {
+    try checkClErrCode( c.clRetainEvent(event) );
+}
+
+pub fn waitForEvents(events: []const Event) OpenClErr!void {
+    try checkClErrCode( c.clWaitForEvents(@intCast(u32, events.len), events.ptr) );
 }

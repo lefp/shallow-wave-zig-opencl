@@ -99,7 +99,11 @@ const c = @cImport({
 });
 
 const log = std.log;
+const time = std.time;
 const allocator = std.heap.c_allocator;
+const Atomic = std.atomic.Atomic;
+const AtomicOrdering = std.atomic.Ordering;
+const Thread = std.Thread;
 
 //
 // MAIN ======================================================================================================
@@ -137,8 +141,11 @@ pub fn main() !void {
     const ocl_context = try cl.createContext(&[_]cl.Device{ocl_device});
     defer cl.releaseContext(ocl_context) catch log.warn("failed to release context", .{});
 
-    const ocl_queue = try cl.createCommandQueue(ocl_context, ocl_device, .{});
-    defer cl.releaseCommandQueue(ocl_queue) catch log.warn("failed to release queue", .{});
+    const sim_render_queue = try cl.createCommandQueue(ocl_context, ocl_device, .{});
+    defer cl.releaseCommandQueue(sim_render_queue) catch log.warn("failed to release queue", .{});
+
+    const data_transfer_queue = try cl.createCommandQueue(ocl_context, ocl_device, .{});
+    defer cl.releaseCommandQueue(data_transfer_queue) catch log.warn("failed to release queue", .{});
 
     const ocl_image = try cl.createImage(
         ocl_context,
@@ -276,7 +283,7 @@ pub fn main() !void {
     ).?;
     defer c.SDL_DestroyTexture(sdl_texture);
 
-    // -------------------------------------------------------------------------------------------------------
+    // misc initialization -----------------------------------------------------------------------------------
 
     // @todo Let OpenCL allocate this using CL_MEM_ALLOC_HOST_PTR, because "something something pinned memory
     // is fast".
@@ -284,7 +291,7 @@ pub fn main() !void {
 
     // render first frame
     try cl.enqueueNDRangeKernel(
-        ocl_queue,
+        sim_render_queue,
         render_kernel,
         2,
         null,
@@ -294,7 +301,7 @@ pub fn main() !void {
         null
     );
     try cl.enqueueReadImage(
-        ocl_queue,
+        sim_render_queue, // same queue, we want it to happen in order
         ocl_image,
         true,
         &[_]usize {0, 0, 0},
@@ -312,68 +319,58 @@ pub fn main() !void {
     enforce0(c.SDL_RenderCopy(sdl_renderer, sdl_texture, null, null));
     c.SDL_RenderPresent(sdl_renderer);
 
+    // main loop ---------------------------------------------------------------------------------------------
+
     // loop variables
     var event: c.SDL_Event = undefined;
     var exists_pending_event: bool = undefined;
-    var frame_timer = try std.time.Timer.start();
-    const perf_reporting = struct {
-        var current_iter: usize = 0;
-        var iter_one_second_ago: usize = 0;
-        var timer: std.time.Timer = undefined;
-    };
-    perf_reporting.timer = try std.time.Timer.start();
-    var paused: bool = true;
+    var frame_timer = try time.Timer.start();
+    var paused = Atomic(bool).init(true);
+
+    // launch sim thread
+    var sim_thread_should_quit = Atomic(bool).init(false);
+    const sim_thread = try Thread.spawn(
+        .{},
+        simulation_thread,
+        .{ sim_render_queue, simulation_kernel, &paused, &sim_thread_should_quit }
+    );
 
     main_loop: while (true) {
         // process pending events
         exists_pending_event = c.SDL_PollEvent(&event) != 0;
         while (exists_pending_event) : (exists_pending_event = c.SDL_PollEvent(&event) != 0) {
             switch (event.type) {
-                c.SDL_QUIT => break :main_loop,
-                c.SDL_KEYDOWN =>  { if (event.key.keysym.sym == c.SDLK_p) paused = !paused; },
+                c.SDL_QUIT => {
+                    sim_thread_should_quit.store(true, AtomicOrdering.Monotonic);
+                    break :main_loop;
+                },
+                c.SDL_KEYDOWN => {
+                    if (event.key.keysym.sym == c.SDLK_p) paused.store(
+                        !paused.loadUnchecked(), AtomicOrdering.Monotonic
+                    );
+                },
                 else => {},
             }
         }
 
         // if paused, take no further action
-        if (paused) continue;
-
-        // keep simulating
-        try cl.enqueueNDRangeKernel(
-            ocl_queue,
-            simulation_kernel,
-            2,
-            null,
-            &[_]usize {GRID.n_gridpoints.x, GRID.n_gridpoints.y},
-            null,
-            null,
-            null
-        );
-
-        perf_reporting.current_iter += @as(usize, 1);
-        // print iteration data
-        if (perf_reporting.timer.read() >= 1_000_000_000) { // one second = 1_000_000_000 nanoseconds
-            perf_reporting.timer.reset();
-            // @todo not sure of the appropriate log type to use here; maybe create a special "perf" log
-            // output thing? We don't want a shitton of these messages being written to a file.
-            log.debug(
-                "iteration: {:10} ({:7} per second)",
-                .{
-                    perf_reporting.current_iter,
-                    perf_reporting.current_iter - perf_reporting.iter_one_second_ago
-                }
-            );
-            perf_reporting.iter_one_second_ago = perf_reporting.current_iter;
-        }
+        if (paused.loadUnchecked()) continue;
 
         // update display
         if (frame_timer.read() >= FRAMERATE.interval_nanoseconds) {
             frame_timer.reset();
             try cl.enqueueNDRangeKernel(
-                ocl_queue, render_kernel, 2, null, &[_]usize {TEXTURE.width, TEXTURE.height}, null, null, null
+                sim_render_queue,
+                render_kernel,
+                2,
+                null,
+                &[_]usize {TEXTURE.width, TEXTURE.height},
+                null,
+                null,
+                null
             );
             try cl.enqueueReadImage(
-                ocl_queue,
+                data_transfer_queue,
                 ocl_image,
                 true,
                 &[_]usize {0, 0, 0},
@@ -392,7 +389,92 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("end of main\n", .{});
+    log.info("Main: waiting for simulation thread to finish.", .{});
+    sim_thread.join();
+    log.info("Quitting.\n", .{});
+}
+
+fn simulation_thread(
+    queue: cl.CommandQueue,
+    simulation_kernel: cl.Kernel,
+    paused: *const Atomic(bool),
+    quit: *const Atomic(bool) // @note these two atomics would be more efficient in one variable, but keeping it simple for now
+) !void {
+    // We use batching, and wait for batch k-1 to complete before enqueueing batch k+1.
+    // This is because simply enqueueing commands nonstop can cause the queue to grow unboundedly,
+    // eating up all the host's memory.
+    // At least, that's what I think happened to me. In any case, the OpenCL spec doesn't protect against that.
+    const batch_size: usize = 1000;
+
+    // increment OpenCL reference counts, just to be safe
+    try cl.retainCommandQueue(queue);
+    defer cl.releaseCommandQueue(queue) catch log.warn("sim thread: failed to release command queue", .{});
+    try cl.retainKernel(simulation_kernel);
+    defer cl.releaseKernel(simulation_kernel) catch log.warn("sim thread: failed to release kernel", .{});
+
+    var iters_completed: usize = 0;
+    var print_timer: time.Timer = try time.Timer.start();
+    // note: this start time is meaningless; don't take the first value seriously
+    var batch_timer: time.Timer = try time.Timer.start();
+    var last_batch_duration_nanoseconds: u64 = 0;
+    var batch_event_0: cl.Event = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
+    var batch_event_1: cl.Event = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
+
+    // @todo return when some condition is satisfied, so that the main thread doesn't need to kill this one
+    while (true) {
+        if (quit.*.load(AtomicOrdering.Monotonic)) break;
+        // @todo don't busy-wait; maybe use a Semaphore?
+        if (paused.*.load(AtomicOrdering.Monotonic)) continue;
+
+        try cl.waitForEvents(&.{batch_event_0});
+        last_batch_duration_nanoseconds = batch_timer.lap();
+        iters_completed += batch_size;
+        try cl.releaseEvent(batch_event_0);
+        batch_event_0 = batch_event_1;
+        batch_event_1 = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
+
+
+        // print iteration info
+        if (print_timer.read() >= time.ns_per_s) { // one second
+            print_timer.reset();
+            // @todo not sure of the appropriate log type to use here; maybe create a special "perf" log
+            // output thing? We don't want a shitton of these messages being written to a file.
+            log.debug(
+                "iteration: {:10} ({d:7.0} per second)",
+                .{
+                    iters_completed,
+                    @as(f32, batch_size) * time.ns_per_s / @intToFloat(f32, last_batch_duration_nanoseconds),
+                }
+            );
+        }
+    }
+
+    // clean up
+    try cl.waitForEvents(&.{batch_event_1});
+    try cl.releaseEvent(batch_event_0);
+    try cl.releaseEvent(batch_event_1);
+}
+
+/// Returns an event associated with the last command in the batch.
+/// @note The caller is responsible for calling `releaseEvent()` on every returned event!
+fn enqueue_sim_batch(batch_size: usize, queue: cl.CommandQueue, kernel: cl.Kernel) cl.OpenClErr!cl.Event {
+    for (0..batch_size-1) |_| {
+        try cl.enqueueNDRangeKernel(
+            queue, kernel, 2, null,
+            &[_]usize {GRID.n_gridpoints.x, GRID.n_gridpoints.y},
+            null, null, null
+        );
+    }
+
+    var event: cl.Event = undefined;
+    try cl.enqueueNDRangeKernel(
+        queue, kernel, 2, null,
+        &[_]usize {GRID.n_gridpoints.x, GRID.n_gridpoints.y},
+        null, null, &event
+    );
+
+    try cl.flush(queue);
+    return event;
 }
 
 //
