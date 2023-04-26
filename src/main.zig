@@ -357,6 +357,8 @@ pub fn main() !void {
         // update display
         if (frame_timer.read() >= FRAMERATE.interval_nanoseconds) {
             frame_timer.reset();
+
+            var render_complete_event: cl.Event = undefined;
             try cl.enqueueNDRangeKernel(
                 sim_render_queue,
                 render_kernel,
@@ -365,20 +367,22 @@ pub fn main() !void {
                 &[_]usize {TEXTURE.width, TEXTURE.height},
                 null,
                 null,
-                null
+                &render_complete_event
             );
             try cl.enqueueReadImage(
                 data_transfer_queue,
                 ocl_image,
-                true,
+                true, // @note if you change this to non-blocking, make sure the read completes before enqueueing the next render
                 &[_]usize {0, 0, 0},
                 &[_]usize {TEXTURE.width, TEXTURE.height, 1},
                 TEXTURE.width * PIXEL_FORMAT.bytes_per_pixel,
                 0,
                 &pixel_hostbuffer,
-                null,
+                &.{render_complete_event}, // explicit wait because we're using different queues
                 null
             );
+            try cl.releaseEvent(render_complete_event);
+
             enforce0(c.SDL_UpdateTexture(
                 sdl_texture, null, &pixel_hostbuffer, TEXTURE.width*PIXEL_FORMAT.bytes_per_pixel
             ));
