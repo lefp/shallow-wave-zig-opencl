@@ -322,8 +322,7 @@ pub fn main() !void {
     // main loop ---------------------------------------------------------------------------------------------
 
     // loop variables
-    var event: c.SDL_Event = undefined;
-    var exists_pending_event: bool = undefined;
+    var sdl_event: c.SDL_Event = undefined;
     var frame_timer = try time.Timer.start();
     var paused = Atomic(bool).init(true);
 
@@ -337,15 +336,14 @@ pub fn main() !void {
 
     main_loop: while (true) {
         // process pending events
-        exists_pending_event = c.SDL_PollEvent(&event) != 0;
-        while (exists_pending_event) : (exists_pending_event = c.SDL_PollEvent(&event) != 0) {
-            switch (event.type) {
+        while (c.SDL_PollEvent(&sdl_event) != 0) {
+            switch (sdl_event.type) {
                 c.SDL_QUIT => {
                     sim_thread_should_quit.store(true, AtomicOrdering.Monotonic);
                     break :main_loop;
                 },
                 c.SDL_KEYDOWN => {
-                    if (event.key.keysym.sym == c.SDLK_p) paused.store(
+                    if (sdl_event.key.keysym.sym == c.SDLK_p) paused.store(
                         !paused.loadUnchecked(), AtomicOrdering.Monotonic
                     );
                 },
