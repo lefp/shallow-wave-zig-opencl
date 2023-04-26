@@ -422,7 +422,6 @@ fn simulation_thread(
     var batch_event_0: cl.Event = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
     var batch_event_1: cl.Event = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
 
-    // @todo return when some condition is satisfied, so that the main thread doesn't need to kill this one
     while (true) {
         if (quit.*.load(AtomicOrdering.Monotonic)) break;
         // @todo don't busy-wait; maybe use a Semaphore?
