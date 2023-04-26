@@ -324,35 +324,34 @@ pub fn main() !void {
     // loop variables
     var sdl_event: c.SDL_Event = undefined;
     var frame_timer = try time.Timer.start();
-    var paused = Atomic(bool).init(true);
+    var paused: bool = true;
 
     // launch sim thread
-    var sim_thread_should_quit = Atomic(bool).init(false);
-    const sim_thread = try Thread.spawn(
-        .{},
-        simulation_thread,
-        .{ sim_render_queue, simulation_kernel, &paused, &sim_thread_should_quit }
-    );
+    var sim_thread = SimulationThreadWrapper.init(paused);
+    try sim_thread.spawn(sim_render_queue, simulation_kernel);
 
     main_loop: while (true) {
         // process pending events
         while (c.SDL_PollEvent(&sdl_event) != 0) {
             switch (sdl_event.type) {
                 c.SDL_QUIT => {
-                    sim_thread_should_quit.store(true, AtomicOrdering.Monotonic);
+                    log.info("Main: waiting for simulation thread to quit.", .{});
+                    sim_thread.quit_and_join();
                     break :main_loop;
                 },
                 c.SDL_KEYDOWN => {
-                    if (sdl_event.key.keysym.sym == c.SDLK_p) paused.store(
-                        !paused.loadUnchecked(), AtomicOrdering.Monotonic
-                    );
+                    if (sdl_event.key.keysym.sym == c.SDLK_p) {
+                        paused = !paused;
+                        sim_thread.setPaused(paused);
+                    }
                 },
                 else => {},
             }
         }
 
         // if paused, take no further action
-        if (paused.loadUnchecked()) continue;
+        // @todo this is busy-waiting, do something more efficient
+        if (paused) continue;
 
         // update display
         if (frame_timer.read() >= FRAMERATE.interval_nanoseconds) {
@@ -391,16 +390,73 @@ pub fn main() !void {
         }
     }
 
-    log.info("Main: waiting for simulation thread to finish.", .{});
-    sim_thread.join();
-    log.info("Quitting.\n", .{});
+    log.info("Main thread exiting.\n", .{});
 }
 
-fn simulation_thread(
+//
+// SIMULATION THREAD =========================================================================================
+//
+
+/// Convenience wrapper for managing the simulation thread.
+/// The spawned thread gets a pointer to the struct; don't delete or move the struct before calling `join`.
+const SimulationThreadWrapper = struct {
+    thread: ?Thread,
+    intended_execution_state: AtomicExecutionState,
+
+    /// If `initially_paused` is set, then the caller will need to send an unpause for the thread to begin work.
+    pub fn init(initially_paused: bool) SimulationThreadWrapper {
+        return SimulationThreadWrapper {
+            .thread = null,
+            .intended_execution_state = AtomicExecutionState.init(
+                if (initially_paused) ExecutionState.paused else ExecutionState.running
+            ),
+        };
+    }
+
+    pub fn spawn(
+        self: *SimulationThreadWrapper,
+        queue: cl.CommandQueue,
+        simulation_kernel: cl.Kernel
+    ) Thread.SpawnError!void {
+        std.debug.assert(self.thread == null);
+        self.thread = try Thread.spawn(
+            .{},
+            simulation_thread_fn,
+            .{ queue, simulation_kernel, &self.intended_execution_state }
+        );
+    }
+
+    /// Pauses if true, otherwise continues execution.
+    /// It's safe to pause an already-paused thread, and to unpause and already-executing thread. But maybe
+    /// doing so extremely frequently would slow things down due to contention for the atomics (idk).
+    pub fn setPaused(self: *SimulationThreadWrapper, paused: bool) void {
+        self.intended_execution_state.store(
+            if (paused) ExecutionState.paused else ExecutionState.running,
+            AtomicOrdering.Monotonic
+        );
+    }
+
+    /// Tells the thread to quit, and blocks until it does.
+    pub fn quit_and_join(self: *SimulationThreadWrapper) void {
+        std.debug.assert(self.thread != null);
+        self.intended_execution_state.store(ExecutionState.quit, AtomicOrdering.Monotonic);
+        self.thread.?.join();
+    }
+};
+
+const AtomicExecutionState = Atomic(ExecutionState);
+// Why not u2 for the enum type? Because I don't know how Zig/LLVM atomics are implemented, and conjecture
+// that atomic usize is likely to be implemented efficiently.
+const ExecutionState = enum(usize) {
+    running,
+    paused,
+    quit,
+};
+
+fn simulation_thread_fn(
     queue: cl.CommandQueue,
     simulation_kernel: cl.Kernel,
-    paused: *const Atomic(bool),
-    quit: *const Atomic(bool) // @note these two atomics would be more efficient in one variable, but keeping it simple for now
+    intended_execution_state: *const AtomicExecutionState
 ) !void {
     // We use batching, and wait for batch k-1 to complete before enqueueing batch k+1.
     // This is because simply enqueueing commands nonstop can cause the queue to grow unboundedly,
@@ -419,13 +475,16 @@ fn simulation_thread(
     // note: this start time is meaningless; don't take the first value seriously
     var batch_timer: time.Timer = try time.Timer.start();
     var last_batch_duration_nanoseconds: u64 = 0;
+    // @todo if thread starts paused, wait for an unpause before enqueueing work
     var batch_event_0: cl.Event = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
     var batch_event_1: cl.Event = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
 
-    while (true) {
-        if (quit.*.load(AtomicOrdering.Monotonic)) break;
-        // @todo don't busy-wait; maybe use a Semaphore?
-        if (paused.*.load(AtomicOrdering.Monotonic)) continue;
+    main_loop: while (true) {
+        switch (intended_execution_state.load(AtomicOrdering.Monotonic)) {
+            .quit => break :main_loop,
+            .paused => continue :main_loop, // @todo don't busy-wait; maybe use a Semaphore?
+            .running => {}
+        }
 
         try cl.waitForEvents(&.{batch_event_0});
         last_batch_duration_nanoseconds = batch_timer.lap();
@@ -433,7 +492,6 @@ fn simulation_thread(
         try cl.releaseEvent(batch_event_0);
         batch_event_0 = batch_event_1;
         batch_event_1 = try enqueue_sim_batch(batch_size, queue, simulation_kernel);
-
 
         // print iteration info
         if (print_timer.read() >= time.ns_per_s) { // one second
@@ -479,7 +537,7 @@ fn enqueue_sim_batch(batch_size: usize, queue: cl.CommandQueue, kernel: cl.Kerne
 }
 
 //
-// STRUCTS AND FUNCTIONS =====================================================================================
+// MISC STRUCTS AND FUNCTIONS ================================================================================
 //
 
 // const PixelFormat = struct {
