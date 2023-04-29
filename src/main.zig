@@ -342,7 +342,7 @@ pub fn main() !void {
                 c.SDL_KEYDOWN => {
                     if (sdl_event.key.keysym.sym == c.SDLK_p) {
                         paused = !paused;
-                        sim_thread.setPaused(paused);
+                        if (paused) sim_thread.pause() else sim_thread.unpause();
                     }
                 },
                 else => {},
@@ -399,6 +399,7 @@ pub fn main() !void {
 
 /// Convenience wrapper for managing the simulation thread.
 /// The spawned thread gets a pointer to the struct; don't delete or move the struct before calling `join`.
+/// Use `.init()`, eventually followed by `.spawn()` to start the thread.
 const SimulationThreadWrapper = struct {
     thread: ?Thread,
     intended_execution_state: AtomicExecutionState,
@@ -426,37 +427,61 @@ const SimulationThreadWrapper = struct {
         );
     }
 
-    /// Pauses if true, otherwise continues execution.
-    /// It's safe to pause an already-paused thread, and to unpause and already-executing thread. But maybe
-    /// doing so extremely frequently would slow things down due to contention for the atomics (idk).
-    pub fn setPaused(self: *SimulationThreadWrapper, paused: bool) void {
-        self.intended_execution_state.store(
-            if (paused) ExecutionState.paused else ExecutionState.running,
-            AtomicOrdering.Monotonic
-        );
+    /// It's safe to pause an already-paused thread.
+    pub fn pause(self: *SimulationThreadWrapper) void {
+        self.intended_execution_state.store(ExecutionState.paused, AtomicOrdering.Monotonic);
+    }
+    /// It's safe to unpause an already-executing thread, but doing so frequently may be inefficient because
+    /// it may make unnecessary syscalls.
+    pub fn unpause(self: *SimulationThreadWrapper) void {
+        self.intended_execution_state.store(ExecutionState.running, AtomicOrdering.Monotonic);
+        // @note if we end up calling `unpause` frequently while the thread isn't paused, put this `wake()`
+        // part in an `if` statement so that we don't make unnecessary syscalls
+        futexWakeOneThread(&self.intended_execution_state);
     }
 
     /// Tells the thread to quit, and blocks until it does.
     pub fn quit_and_join(self: *SimulationThreadWrapper) void {
         std.debug.assert(self.thread != null);
+        // we can `loadUnchecked()` because we're the only thread that modifies the value
+        const prev_state = self.intended_execution_state.loadUnchecked();
         self.intended_execution_state.store(ExecutionState.quit, AtomicOrdering.Monotonic);
+        // make sure the thread isn't stuck waiting for an unpause
+        if (prev_state == ExecutionState.paused) futexWakeOneThread(&self.intended_execution_state);
         self.thread.?.join();
     }
 };
 
 const AtomicExecutionState = Atomic(ExecutionState);
-// Why not u2 for the enum type? Because I don't know how Zig/LLVM atomics are implemented, and conjecture
-// that atomic usize is likely to be implemented efficiently.
-const ExecutionState = enum(usize) {
+// The enum is a `u32` because we use it in a Futex, which is requires a u32.
+// Even if we weren't using a Futex, I wouldn't use a u2 because I don't know how Zig/LLVM atomics are
+// implemented, and I conjecture that something like atomic u32 or atomic usize is likely to be implemented
+// efficiently.
+const ExecutionState = enum(u32) {
     running,
     paused,
     quit,
 };
 
+/// Note: may spuriously return.
+fn futexWaitWhilePausedSpurious(execution_state: *const AtomicExecutionState) void {
+    Thread.Futex.wait(
+        @ptrCast(*const Atomic(u32), execution_state),
+        @enumToInt(ExecutionState.paused)
+    );
+}
+/// `execution_state` must be a pointer to the same memory address used by the thread that called `wait()`.
+fn futexWakeOneThread(execution_state: *const AtomicExecutionState) void {
+    Thread.Futex.wake(
+        @ptrCast(*const Atomic(u32), execution_state),
+        1
+    );
+}
+
 fn simulation_thread_fn(
     queue: cl.CommandQueue,
     simulation_kernel: cl.Kernel,
-    intended_execution_state: *const AtomicExecutionState
+    intended_execution_state: *const AtomicExecutionState, // used to tell this thread to continue/pause/quit
 ) !void {
     // We use batching, and wait for batch k-1 to complete before enqueueing batch k+1.
     // This is because simply enqueueing commands nonstop can cause the queue to grow unboundedly,
@@ -481,9 +506,14 @@ fn simulation_thread_fn(
 
     main_loop: while (true) {
         switch (intended_execution_state.load(AtomicOrdering.Monotonic)) {
+            .running => {},
+            .paused => {
+                futexWaitWhilePausedSpurious(intended_execution_state);
+                // Jump back to this switch statement to see what the new value is.
+                // This is also necessary in case the wait spuriously returned.
+                continue :main_loop;
+            },
             .quit => break :main_loop,
-            .paused => continue :main_loop, // @todo don't busy-wait; maybe use a Semaphore?
-            .running => {}
         }
 
         try cl.waitForEvents(&.{batch_event_0});
