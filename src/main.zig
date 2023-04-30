@@ -331,8 +331,15 @@ pub fn main() !void {
     try sim_thread.spawn(sim_render_queue, simulation_kernel);
 
     main_loop: while (true) {
-        // process pending events
-        while (c.SDL_PollEvent(&sdl_event) != 0) {
+        process_events: while (true) {
+            // If paused, just keep waiting for and processing events.
+            // Otherwise, process pending events and move on the the rest of the main loop.
+            if (paused) try sdlWaitEvent(&sdl_event)
+            else {
+                const exists = sdlPollEvent(&sdl_event);
+                if (!exists) break :process_events;
+            }
+
             switch (sdl_event.type) {
                 c.SDL_QUIT => {
                     log.info("Main: waiting for simulation thread to quit.", .{});
@@ -348,10 +355,6 @@ pub fn main() !void {
                 else => {},
             }
         }
-
-        // if paused, take no further action
-        // @todo this is busy-waiting, do something more efficient
-        if (paused) continue;
 
         // update display
         if (frame_timer.read() >= FRAMERATE.interval_nanoseconds) {
@@ -578,6 +581,15 @@ fn enqueue_sim_batch(batch_size: usize, queue: cl.CommandQueue, kernel: cl.Kerne
 
 inline fn enforce0(val: c_int) void {
     if (val != 0) @panic("Value was not 0");
+}
+
+/// Returns false iff there were no available events.
+fn sdlPollEvent(event: *c.SDL_Event) bool {
+    return 1 == c.SDL_PollEvent(event);
+}
+/// Returns an error if something went wrong while waiting.
+fn sdlWaitEvent(event: *c.SDL_Event) !void {
+    if (1 != c.SDL_WaitEvent(event)) return error.SdlWaitEventError;
 }
 
 inline fn square(x: anytype) @TypeOf(x) { return x*x; }
